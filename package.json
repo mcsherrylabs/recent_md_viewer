@@ -1,0 +1,44 @@
+{
+  "name": "recent_md_viewer",
+  "version": "1.0.0",
+  "description": "Watch a folder and live-stack recently changed Markdown files in a browser dashboard",
+  "bin": {
+    "md-stack": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "md-stack.service"
+  ],
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "markdown",
+    "viewer",
+    "watch",
+    "live-reload",
+    "preview",
+    "claude-code"
+  ],
+  "author": "Alan McSherry",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mcsherrylabs/recent_md_viewer.git"
+  },
+  "homepage": "https://github.com/mcsherrylabs/recent_md_viewer#readme",
+  "bugs": {
+    "url": "https://github.com/mcsherrylabs/recent_md_viewer/issues"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "commander": "^15.0.0",
+    "express": "^5.2.1",
+    "marked": "^18.0.14",
+    "ws": "^8.22.0"
+  }
+}

@@ -1,0 +1,14 @@
+[Unit]
+Description=md-stack live markdown viewer
+
+# Template for a systemd user service - see "Run it as a service" in README.md.
+# NODE_BIN and MD_STACK_BIN are placeholders for the output of `which node` and
+# `which md-stack`; systemd doesn't see the PATH that nvm sets up, so both need
+# to be absolute. Change --dir to the folder you want to watch.
+[Service]
+ExecStart=NODE_BIN MD_STACK_BIN --dir %h/develop --port 26622
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
