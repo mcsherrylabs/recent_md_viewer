@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 
-const { program } = require('commander');
+const { program, Option } = require('commander');
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const chokidar = require('chokidar');
 const fs = require('fs');
 const path = require('path');
 const { marked } = require('marked');
@@ -17,6 +16,8 @@ program
   .option('-H, --host <address>', 'address to listen on (0.0.0.0 exposes it to your network)', '127.0.0.1')
   .option('-e, --expiry <minutes>', 'expiry time in minutes for inactive files', '30')
   .option('-d, --dir <path>', 'directory to watch', process.cwd())
+  .addOption(new Option('-w, --watcher <type>', 'file watcher to use (auto: native on macOS/Windows, chokidar elsewhere)')
+    .choices(['auto', 'native', 'chokidar']).default('auto'))
   .parse(process.argv);
 
 const options = program.opts();
@@ -24,6 +25,12 @@ const PORT = parseInt(options.port, 10);
 const HOST = options.host;
 const EXPIRY_MS = parseFloat(options.expiry) * 60 * 1000;
 const WATCH_DIR = path.resolve(options.dir);
+
+// macOS (FSEvents) and Windows watch a whole tree natively with one handle, so
+// size doesn't matter. Linux has no native recursive watch: Node emulates it by
+// watching every file with no way to skip node_modules, so chokidar is used there
+const USE_NATIVE = options.watcher === 'native' ||
+  (options.watcher === 'auto' && ['darwin', 'win32'].includes(process.platform));
 
 const app = express();
 const server = http.createServer(app);
@@ -51,17 +58,7 @@ const IGNORED_DIRS = new Set([
   '.next', '.cache', '.cargo', '.gradle', '.pytest_cache', '.mypy_cache', '.turbo',
   'coverage', 'vendor'
 ]);
-
-// File Watcher (chokidar v4+ has no glob support, so watch the dir and filter).
-// Only files added/changed after startup are stacked.
-const watcher = chokidar.watch(WATCH_DIR, {
-  ignored: (filePath, stats) =>
-    path.relative(WATCH_DIR, filePath).split(path.sep).some(seg => IGNORED_DIRS.has(seg)) ||
-    (stats?.isFile() && !filePath.endsWith('.md')),
-  persistent: true,
-  ignoreInitial: true,
-  ignorePermissionErrors: true
-});
+const isIgnored = relPath => relPath.split(path.sep).some(seg => IGNORED_DIRS.has(seg));
 
 function updateFile(filePath) {
   try {
@@ -96,7 +93,7 @@ const WATCH_ERROR_HINTS = {
   ENOSPC: 'The inotify watch limit is reached. Raise it with: sudo sysctl fs.inotify.max_user_watches=524288',
   EMFILE: process.platform === 'linux'
     ? 'The inotify instance limit is reached. Raise it with: sudo sysctl fs.inotify.max_user_instances=1024'
-    : 'The open file limit is reached (each watched .md file uses one).'
+    : 'The open file limit is reached (each watched .md file uses one). --watcher native avoids this on macOS and Windows.'
 };
 WATCH_ERROR_HINTS.ENFILE = WATCH_ERROR_HINTS.EMFILE;
 
@@ -141,25 +138,88 @@ function onWatchError(err) {
   if (scanDone && !reportTimer) reportTimer = setTimeout(reportWatchErrors, 60000);
 }
 
-const watchStart = Date.now();
-watcher
-  .on('add', updateFile)
-  .on('change', updateFile)
-  .on('unlink', removeFile)
-  .on('ready', () => {
-    scanDone = true;
-    const dirs = Object.keys(watcher.getWatched()).length;
-    const secs = ((Date.now() - watchStart) / 1000).toFixed(1);
-    if (!watchErrors.size) {
-      console.log(` Ready: watching ${dirs} dirs (scanned in ${secs}s), waiting for changes...`);
-      return;
+// Both watchers can fire several times per save, and chokidar drops changes
+// within 50ms of the last one, so the final write of a burst could be missed
+// (or the file read half-written). Each path waits until it's been quiet for
+// SETTLE_MS, longer than chokidar's window, and then we look at what's on disk
+const SETTLE_MS = 100;
+const pendingPaths = new Map(); // relative path -> settle timer
+
+const stackedUnder = dir => [...activeStack.values()].filter(i => !i.deleted && i.path.startsWith(dir + path.sep));
+
+function schedulePath(relPath) {
+  clearTimeout(pendingPaths.get(relPath));
+  pendingPaths.set(relPath, setTimeout(() => {
+    pendingPaths.delete(relPath);
+    settlePath(relPath);
+  }, SETTLE_MS));
+}
+
+function settlePath(relPath) {
+  const absPath = path.join(WATCH_DIR, relPath);
+  fs.stat(absPath, (err, stats) => {
+    if (!err) {
+      if (stats.isFile() && relPath.endsWith('.md')) updateFile(absPath);
+    } else if (err.code === 'ENOENT') {
+      if (relPath.endsWith('.md')) removeFile(absPath);
+      // The native watcher only reports a deleted or moved folder, not its files
+      for (const item of stackedUnder(relPath)) removeFile(item.absPath);
     }
-    console.error(` Ready: scanned ${dirs} dirs in ${secs}s, but ${watchErrorSummary()}.`);
-    console.error(`   Changes in those paths won't show up.`);
-    unreportedErrors = 0;
-    broadcastStack(); // dashboards that connected mid-scan have a stale count
-  })
-  .on('error', onWatchError);
+  });
+}
+
+// chokidar v4+ has no glob support, so watch the dir and filter.
+// Only files added/changed after startup are stacked.
+function watchWithChokidar() {
+  const watchStart = Date.now();
+  const watcher = require('chokidar').watch(WATCH_DIR, {
+    ignored: (filePath, stats) =>
+      isIgnored(path.relative(WATCH_DIR, filePath)) || (stats?.isFile() && !filePath.endsWith('.md')),
+    persistent: true,
+    ignoreInitial: true,
+    ignorePermissionErrors: true
+  });
+  const onPath = filePath => schedulePath(path.relative(WATCH_DIR, filePath));
+  watcher
+    .on('add', onPath)
+    .on('change', onPath)
+    .on('unlink', onPath)
+    .on('ready', () => {
+      scanDone = true;
+      const dirs = Object.keys(watcher.getWatched()).length;
+      const secs = ((Date.now() - watchStart) / 1000).toFixed(1);
+      if (!watchErrors.size) {
+        console.log(` Ready: watching ${dirs} dirs (scanned in ${secs}s), waiting for changes...`);
+        return;
+      }
+      console.error(` Ready: scanned ${dirs} dirs in ${secs}s, but ${watchErrorSummary()}.`);
+      console.error(`   Changes in those paths won't show up.`);
+      unreportedErrors = 0;
+      broadcastStack(); // dashboards that connected mid-scan have a stale count
+    })
+    .on('error', onWatchError);
+}
+
+// The native watcher reports a bare 'rename' or 'change' for any path in the
+// tree, relative to WATCH_DIR, so the filtering chokidar does happens here
+function watchNatively() {
+  const onEvent = (eventType, filename) => {
+    if (!filename) return;
+    const relPath = filename.toString();
+    if (isIgnored(relPath)) return;
+    // Non-Markdown paths only matter if they are folders holding stacked files
+    if (!relPath.endsWith('.md') && !stackedUnder(relPath).length) return;
+    schedulePath(relPath);
+  };
+  try {
+    fs.watch(WATCH_DIR, { recursive: true, persistent: true }, onEvent).on('error', onWatchError);
+  } catch (err) {
+    onWatchError(err);
+    return;
+  }
+  scanDone = true;
+  console.log(' Ready: watching the whole tree with the native watcher, waiting for changes...');
+}
 
 function serializeStack() {
   const items = Array.from(activeStack.values()).sort((a, b) => b.timestamp - a.timestamp);
@@ -427,10 +487,14 @@ wss.on('error', onListenError);
 // Wildcard addresses aren't browsable, so point at localhost; IPv6 literals need brackets in URLs
 const urlHost = ['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST.includes(':') ? `[${HOST}]` : HOST;
 
+// Start watching once the port is ours, so a clash doesn't scan a big tree first
 server.listen(PORT, HOST, () => {
   console.log(`\n md-stack active!`);
   console.log(` Watching: ${WATCH_DIR}`);
+  console.log(` Watcher : ${USE_NATIVE ? 'native' : 'chokidar'}`);
   console.log(` Expiry  : ${options.expiry} minutes`);
   console.log(` Listening: ${HOST}`);
   console.log(` Dashboard: http://${urlHost}:${PORT}\n`);
+  if (USE_NATIVE) watchNatively();
+  else watchWithChokidar();
 });

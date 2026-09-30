@@ -42,6 +42,7 @@ Then open the dashboard URL it prints (<http://127.0.0.1:26622> by default).
 | `-p, --port <number>` | `26622` | Port for the web dashboard |
 | `-H, --host <address>` | `127.0.0.1` | Address to listen on |
 | `-e, --expiry <minutes>` | `30` | Remove files from the stack after this long without changes |
+| `-w, --watcher <type>` | `auto` | `native`, `chokidar`, or `auto` (native on macOS and Windows, chokidar elsewhere). See "Large trees" |
 | `-V, --version` | | Print the version |
 | `-h, --help` | | Show help |
 
@@ -68,18 +69,24 @@ Markdown (and images) under the watched folder.
   `node_modules`, `.git`, `target`, `venv`, `.venv`, `__pycache__`, `dist`,
   `build`, `.next`, `.cache`, `.cargo`, `.gradle`, `.pytest_cache`,
   `.mypy_cache`, `.turbo`, `coverage`, `vendor`.
-- **Large trees.** Every watched directory (and `.md` file) uses up a system
-  resource: an inotify watch on Linux, an open file on macOS. If a limit is hit,
-  `md-stack` prints the error once, with a suggested fix, and then only
-  counts the repeats. The dashboard also shows a warning, because anything in
-  folders it couldn't watch won't appear. On Linux the usual fixes are:
+- **Large trees.** On macOS and Windows, `md-stack` uses the operating system's
+  native recursive watcher. That's one handle for the whole tree, so size doesn't
+  matter. Linux has no native equivalent, so there it uses
+  [chokidar](https://github.com/paulmillr/chokidar). chokidar needs one inotify
+  watch per directory (skipping the folders listed above) and per `.md` file.
+  If a limit is hit, `md-stack` prints the error once, with a suggested fix,
+  and then only counts the repeats. The dashboard also shows a warning, because
+  anything in folders it couldn't watch won't appear. The usual fixes are:
   ```bash
   sudo sysctl fs.inotify.max_user_watches=524288    # ENOSPC
   sudo sysctl fs.inotify.max_user_instances=1024    # EMFILE: too many open files
   ```
   (add the same settings to `/etc/sysctl.conf` to keep them after a reboot).
   You can also point `--dir` at a smaller folder. On startup `md-stack` prints
-  how many directories it's watching.
+  which watcher it's using, and with chokidar how many directories it's watching.
+  `--watcher chokidar` switches macOS and Windows back to chokidar if the native
+  watcher misbehaves. `--watcher native` on Linux isn't recommended: Node emulates
+  it by watching every file in the tree, including `node_modules`.
 - **Reconnects automatically.** If `md-stack` restarts or the connection drops
   (sleep, SSH tunnel), the open dashboard reconnects without a reload. Until it
   does, it shows a "Disconnected" banner. The stack lives in memory, so a
