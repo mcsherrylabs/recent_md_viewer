@@ -89,21 +89,81 @@ function removeFile(filePath) {
   broadcastStack();
 }
 
+// Once a watch limit is hit, every remaining folder fails the same way, so a big
+// tree would print thousands of identical errors. Each error code is reported
+// once with a fix, and the rest are counted and summarized
+const WATCH_ERROR_HINTS = {
+  ENOSPC: 'The inotify watch limit is reached. Raise it with: sudo sysctl fs.inotify.max_user_watches=524288',
+  EMFILE: process.platform === 'linux'
+    ? 'The inotify instance limit is reached. Raise it with: sudo sysctl fs.inotify.max_user_instances=1024'
+    : 'The open file limit is reached (each watched .md file uses one).'
+};
+WATCH_ERROR_HINTS.ENFILE = WATCH_ERROR_HINTS.EMFILE;
+
+const watchErrors = new Map(); // error code -> number of paths that failed
+let unreportedErrors = 0;
+let reportTimer = null;
+let scanDone = false;
+
+function watchErrorSummary() {
+  const total = [...watchErrors.values()].reduce((a, b) => a + b, 0);
+  return `${total} path${total === 1 ? '' : 's'} could not be watched (${[...watchErrors.keys()].join(', ')})`;
+}
+
+// Shown on the dashboard, since the log isn't visible when md-stack runs as a service
+function watchWarning() {
+  if (!watchErrors.size) return null;
+  const hints = new Set([...watchErrors.keys()].map(code => WATCH_ERROR_HINTS[code]).filter(Boolean));
+  return { summary: `${watchErrorSummary()}, so changes in them won't show up.`, hints: [...hints] };
+}
+
+function reportWatchErrors() {
+  reportTimer = null;
+  if (!unreportedErrors) return;
+  console.error(` ${unreportedErrors} more watcher error${unreportedErrors === 1 ? '' : 's'}; ${watchErrorSummary()} so far`);
+  unreportedErrors = 0;
+  broadcastStack();
+}
+
+function onWatchError(err) {
+  const code = err.code || err.message;
+  const count = (watchErrors.get(code) || 0) + 1;
+  watchErrors.set(code, count);
+  if (count === 1) {
+    console.error(` Watcher error: ${err.message}`);
+    if (WATCH_ERROR_HINTS[code]) console.error(`   ${WATCH_ERROR_HINTS[code]}`);
+    console.error('   Or watch a smaller folder with --dir. Further errors like this are counted, not printed.');
+    broadcastStack();
+    return;
+  }
+  // Repeats during the initial scan are summarized on 'ready'; later ones at most once a minute
+  unreportedErrors++;
+  if (scanDone && !reportTimer) reportTimer = setTimeout(reportWatchErrors, 60000);
+}
+
 const watchStart = Date.now();
 watcher
   .on('add', updateFile)
   .on('change', updateFile)
   .on('unlink', removeFile)
   .on('ready', () => {
+    scanDone = true;
     const dirs = Object.keys(watcher.getWatched()).length;
     const secs = ((Date.now() - watchStart) / 1000).toFixed(1);
-    console.log(` Ready: watching ${dirs} dirs (scanned in ${secs}s), waiting for changes...`);
+    if (!watchErrors.size) {
+      console.log(` Ready: watching ${dirs} dirs (scanned in ${secs}s), waiting for changes...`);
+      return;
+    }
+    console.error(` Ready: scanned ${dirs} dirs in ${secs}s, but ${watchErrorSummary()}.`);
+    console.error(`   Changes in those paths won't show up.`);
+    unreportedErrors = 0;
+    broadcastStack(); // dashboards that connected mid-scan have a stale count
   })
-  .on('error', err => console.error(` Watcher error: ${err.message}`));
+  .on('error', onWatchError);
 
 function serializeStack() {
   const items = Array.from(activeStack.values()).sort((a, b) => b.timestamp - a.timestamp);
-  return JSON.stringify(items);
+  return JSON.stringify({ items, warning: watchWarning() });
 }
 
 function broadcastStack() {
@@ -164,6 +224,11 @@ app.get('/', (req, res) => {
     .empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #484f58; font-style: italic; }
     #toast { position: fixed; bottom: 20px; right: 20px; background: #252a3a; color: #c9d1d9; border: 1px solid #30363d; padding: 8px 14px; border-radius: 6px; font-size: 12px; opacity: 0; transition: opacity 0.2s ease; pointer-events: none; }
     #toast.show { opacity: 1; }
+    #status { display: none; padding: 8px 16px; font-size: 12px; font-weight: 600; background: #2d1417; color: #f85149; border-bottom: 1px solid #262936; }
+    body.disconnected #status { display: block; }
+    body.disconnected #card-list { opacity: 0.5; }
+    #warning { display: none; padding: 10px 16px; font-size: 12px; line-height: 1.5; background: #2b2111; color: #d29922; border-bottom: 1px solid #262936; }
+    #warning code { display: block; margin-top: 4px; overflow-wrap: anywhere; color: #e3b341; }
   </style>
 </head>
 <body>
@@ -172,29 +237,67 @@ app.get('/', (req, res) => {
       <span>STACKED MD FILES</span>
       <span id="count">0</span>
     </div>
+    <div id="status">Disconnected from md-stack, reconnecting...</div>
+    <div id="warning"></div>
     <div id="card-list"></div>
   </div>
   <div id="preview"><div class="empty">Select a file from the stack to preview...</div></div>
   <div id="toast"></div>
 
   <script>
-    const ws = new WebSocket('ws://' + location.host);
+    let ws;
     let stackData = [];
     let selectedPath = null;
 
-    ws.onmessage = (event) => {
-      stackData = JSON.parse(event.data);
+    // Reconnect whenever the socket drops (md-stack restarted, machine slept, SSH
+    // tunnel closed); the server sends the whole stack again on connect
+    let retryDelay = 1000;
+    let retryTimer = null;
+    function connect() {
+      ws = new WebSocket('ws://' + location.host);
+      ws.onopen = () => {
+        retryDelay = 1000;
+        document.body.classList.remove('disconnected');
+      };
+      ws.onmessage = onStack;
+      ws.onclose = () => {
+        document.body.classList.add('disconnected');
+        retryTimer = setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 10000);
+      };
+    }
+
+    // Background tabs throttle timers, so retry straight away when the tab is shown again
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && ws.readyState === WebSocket.CLOSED) {
+        clearTimeout(retryTimer);
+        connect();
+      }
+    });
+
+    function onStack(event) {
+      const { items, warning } = JSON.parse(event.data);
+      stackData = items;
       document.getElementById('count').innerText = stackData.length;
-      
+      renderWarning(warning);
+
       // Auto-select latest file if none selected or current was removed/deleted
       const liveFiles = stackData.filter(i => !i.deleted);
       if (!selectedPath || !liveFiles.find(i => i.path === selectedPath)) {
         selectedPath = liveFiles.length > 0 ? liveFiles[0].path : null;
       }
-      
+
       renderSidebar();
       renderPreview();
-    };
+    }
+
+    function renderWarning(warning) {
+      const el = document.getElementById('warning');
+      el.style.display = warning ? 'block' : 'none';
+      if (warning) {
+        el.innerHTML = escapeHtml(warning.summary) + warning.hints.map(h => '<code>' + escapeHtml(h) + '</code>').join('');
+      }
+    }
 
     function escapeHtml(str) {
       return str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -221,7 +324,9 @@ app.get('/', (req, res) => {
     document.getElementById('card-list').addEventListener('click', (event) => {
       const card = event.target.closest('.card');
       if (!card) return;
-      if (event.target.closest('.dismiss')) ws.send(JSON.stringify({ type: 'dismiss', path: card.dataset.path }));
+      if (event.target.closest('.dismiss')) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'dismiss', path: card.dataset.path }));
+      }
       else if (!card.classList.contains('deleted')) {
         selectFile(card.dataset.path);
         copyPath(card.dataset.path);
@@ -289,6 +394,8 @@ app.get('/', (req, res) => {
         container.innerHTML = \`<div style="font-size: 12px; color: #58a6ff; margin-bottom: 8px;">\${escapeHtml(item.path)}</div>\` + resolveImages(item.html, item.path);
       }
     }
+
+    connect();
   </script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 {
   "name": "recent_md_viewer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Watch a folder and live-stack recently changed Markdown files in a browser dashboard",
   "bin": {
     "md-stack": "./index.js"

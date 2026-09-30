@@ -68,13 +68,22 @@ Markdown (and images) under the watched folder.
   `node_modules`, `.git`, `target`, `venv`, `.venv`, `__pycache__`, `dist`,
   `build`, `.next`, `.cache`, `.cargo`, `.gradle`, `.pytest_cache`,
   `.mypy_cache`, `.turbo`, `coverage`, `vendor`.
-- **Large trees on Linux.** Linux needs one inotify watch per directory. If you
-  watch something big and see `ENOSPC` or watcher errors, raise the limit:
+- **Large trees.** Every watched directory (and `.md` file) uses up a system
+  resource: an inotify watch on Linux, an open file on macOS. If a limit is hit,
+  `md-stack` prints the error once, with a suggested fix, and then only
+  counts the repeats. The dashboard also shows a warning, because anything in
+  folders it couldn't watch won't appear. On Linux the usual fixes are:
   ```bash
-  sudo sysctl fs.inotify.max_user_watches=524288
+  sudo sysctl fs.inotify.max_user_watches=524288    # ENOSPC
+  sudo sysctl fs.inotify.max_user_instances=1024    # EMFILE: too many open files
   ```
-  (add `fs.inotify.max_user_watches=524288` to `/etc/sysctl.conf` to keep it
-  after a reboot). On startup `md-stack` prints how many directories it's watching.
+  (add the same settings to `/etc/sysctl.conf` to keep them after a reboot).
+  You can also point `--dir` at a smaller folder. On startup `md-stack` prints
+  how many directories it's watching.
+- **Reconnects automatically.** If `md-stack` restarts or the connection drops
+  (sleep, SSH tunnel), the open dashboard reconnects without a reload. Until it
+  does, it shows a "Disconnected" banner. The stack lives in memory, so a
+  restart clears it.
 
 ## Run it as a service (Linux, systemd)
 
