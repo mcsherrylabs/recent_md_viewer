@@ -562,6 +562,28 @@ app.get('/', (req, res) => {
       return tpl.innerHTML;
     }
 
+    // Mermaid is a large bundle, so fetch it only once a page contains a diagram
+    let mermaidReady;
+    function renderMermaid(container) {
+      const blocks = container.querySelectorAll('pre > code.language-mermaid');
+      if (!blocks.length) return;
+      blocks.forEach(code => {
+        const diagram = document.createElement('div');
+        diagram.className = 'mermaid';
+        diagram.textContent = code.textContent;
+        code.parentElement.replaceWith(diagram);
+      });
+      mermaidReady ||= import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs')
+        .then(mod => {
+          mod.default.initialize({ startOnLoad: false, theme: 'dark' });
+          return mod.default;
+        })
+        .catch(err => { mermaidReady = null; throw err; });
+      mermaidReady
+        .then(mermaid => mermaid.run({ nodes: container.querySelectorAll('.mermaid') }))
+        .catch(() => showToast('Could not render Mermaid diagrams'));
+    }
+
     function renderPreview() {
       const container = document.getElementById('preview');
       if (!selectedPath) {
@@ -572,6 +594,7 @@ app.get('/', (req, res) => {
       const item = stackData.find(i => i.path === selectedPath);
       if (item) {
         container.innerHTML = \`<div style="font-size: 12px; color: #58a6ff; margin-bottom: 8px;">\${escapeHtml(item.path)}</div>\` + resolveImages(item.html, item.path);
+        renderMermaid(container);
       }
     }
 

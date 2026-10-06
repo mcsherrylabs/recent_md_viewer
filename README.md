@@ -13,6 +13,7 @@ go looking for which file just changed. It can stack Scala source files too.
 - Files drop off the stack after a period of inactivity (30 minutes by default), or
   all at once with **Clear**
 - Relative image links in the Markdown are resolved and displayed
+- ` ```mermaid ` code blocks are rendered as diagrams
 
 Only changes made **after** `md-stack` starts are shown. It doesn't list the
 files that were already there.
@@ -86,6 +87,9 @@ Markdown (and images) under the watched folder.
 
 - **Trusted folders only.** Markdown is rendered as-is, including any raw HTML it
   contains, so a file with a `<script>` tag would run in the dashboard.
+- **Mermaid needs the network.** The Mermaid library is fetched from the jsDelivr
+  CDN the first time a previewed file contains a diagram. Offline, the diagram
+  stays as source and a toast reports the failure.
 - **Skipped folders.** Dependency, build and cache folders are never watched:
   `node_modules`, `.git`, `target`, `venv`, `.venv`, `__pycache__`, `dist`,
   `build`, `.next`, `.cache`, `.cargo`, `.gradle`, `.pytest_cache`,
