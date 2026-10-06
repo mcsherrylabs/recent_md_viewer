@@ -38,6 +38,35 @@ const wss = new WebSocket.Server({ server });
 
 let activeStack = new Map();
 
+// File types that can be stacked, ticked on and off from the dashboard. Markdown
+// is rendered; any other type is shown as source in a code block
+const FILE_TYPES = { md: '.md', scala: '.scala' };
+const fileType = filePath => Object.keys(FILE_TYPES).find(type => path.extname(filePath) === FILE_TYPES[type]);
+
+// The ticked types (Markdown only to start with) live here with the stack, so every
+// dashboard shares them and a reload keeps them; a restart resets both
+const enabledTypes = new Set(['md']);
+// When each type was last ticked (types ticked from the start count as always). A
+// file that isn't stacked yet only joins if it changed after that, so files touched
+// while their box was unticked stay off (see watchedTypes for the other reason)
+const tickedAt = { md: 0 };
+// Types chokidar watches. A type is added when first ticked and never removed:
+// chokidar re-reads a folder whenever something in it changes, so dropping a type
+// would make it report that type's files as deleted. Adding one makes it report
+// the folder's untouched files of that type as new, which tickedAt filters out
+const watchedTypes = new Set(enabledTypes);
+
+function setTypeEnabled(type, on) {
+  if (on === enabledTypes.has(type)) return;
+  if (on) {
+    enabledTypes.add(type);
+    watchedTypes.add(type);
+    tickedAt[type] = Date.now();
+  } else {
+    enabledTypes.delete(type);
+  }
+}
+
 // Periodic cleanup of expired items
 setInterval(() => {
   const now = Date.now();
@@ -60,10 +89,18 @@ const IGNORED_DIRS = new Set([
 ]);
 const isIgnored = relPath => relPath.split(path.sep).some(seg => IGNORED_DIRS.has(seg));
 
+const escapeHtml = str => str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+function render(filePath, rawContent) {
+  const type = fileType(filePath);
+  if (type === 'md') return marked.parse(rawContent);
+  return `<pre><code class="language-${type}">${escapeHtml(rawContent)}</code></pre>`;
+}
+
 function updateFile(filePath) {
   try {
     const rawContent = fs.readFileSync(filePath, 'utf-8');
-    const htmlContent = marked.parse(rawContent);
+    const htmlContent = render(filePath, rawContent);
     const relativePath = path.relative(WATCH_DIR, filePath);
 
     activeStack.set(relativePath, {
@@ -158,10 +195,14 @@ function schedulePath(relPath) {
 function settlePath(relPath) {
   const absPath = path.join(WATCH_DIR, relPath);
   fs.stat(absPath, (err, stats) => {
+    // Stacked files stay current while their type is unticked (and hidden), so
+    // they're up to date if it's ticked again
+    const stacked = activeStack.has(relPath);
+    const type = fileType(relPath);
     if (!err) {
-      if (stats.isFile() && relPath.endsWith('.md')) updateFile(absPath);
+      if (stats.isFile() && (stacked || (enabledTypes.has(type) && stats.mtimeMs >= tickedAt[type]))) updateFile(absPath);
     } else if (err.code === 'ENOENT') {
-      if (relPath.endsWith('.md')) removeFile(absPath);
+      if (stacked || enabledTypes.has(type)) removeFile(absPath);
       // The native watcher only reports a deleted or moved folder, not its files
       for (const item of stackedUnder(relPath)) removeFile(item.absPath);
     }
@@ -174,7 +215,7 @@ function watchWithChokidar() {
   const watchStart = Date.now();
   const watcher = require('chokidar').watch(WATCH_DIR, {
     ignored: (filePath, stats) =>
-      isIgnored(path.relative(WATCH_DIR, filePath)) || (stats?.isFile() && !filePath.endsWith('.md')),
+      isIgnored(path.relative(WATCH_DIR, filePath)) || (stats?.isFile() && !watchedTypes.has(fileType(filePath))),
     persistent: true,
     ignoreInitial: true,
     ignorePermissionErrors: true
@@ -207,8 +248,8 @@ function watchNatively() {
     if (!filename) return;
     const relPath = filename.toString();
     if (isIgnored(relPath)) return;
-    // Non-Markdown paths only matter if they are folders holding stacked files
-    if (!relPath.endsWith('.md') && !stackedUnder(relPath).length) return;
+    // Paths of other types only matter if they are folders holding stacked files
+    if (!fileType(relPath) && !stackedUnder(relPath).length) return;
     schedulePath(relPath);
   };
   try {
@@ -221,9 +262,13 @@ function watchNatively() {
   console.log(' Ready: watching the whole tree with the native watcher, waiting for changes...');
 }
 
+// Files of unticked types stay on the stack, hidden, until they expire
 function serializeStack() {
-  const items = Array.from(activeStack.values()).sort((a, b) => b.timestamp - a.timestamp);
-  return JSON.stringify({ items, warning: watchWarning() });
+  const items = Array.from(activeStack.values())
+    .filter(item => enabledTypes.has(fileType(item.path)))
+    .sort((a, b) => b.timestamp - a.timestamp);
+  const types = Object.fromEntries(Object.keys(FILE_TYPES).map(type => [type, enabledTypes.has(type)]));
+  return JSON.stringify({ items, types, warning: watchWarning() });
 }
 
 function broadcastStack() {
@@ -248,6 +293,30 @@ wss.on('connection', ws => {
   });
 });
 
+// The control panel's actions are plain HTTP so they can be scripted too. Each one
+// pushes the new stack to every dashboard and responds with it
+const sendStack = res => res.type('json').send(serializeStack());
+
+app.get('/api/stack', (req, res) => sendStack(res));
+
+// Clears hidden files too, so ticking their type again doesn't bring them back
+app.post('/api/clear', (req, res) => {
+  activeStack.clear();
+  broadcastStack();
+  sendStack(res);
+});
+
+// Takes any subset of { "md": true, "scala": false }
+app.post('/api/types', express.json(), (req, res) => {
+  const changes = Object.entries(req.body || {});
+  if (!changes.length || changes.some(([type, on]) => !Object.hasOwn(FILE_TYPES, type) || typeof on !== 'boolean')) {
+    return res.status(400).json({ error: `Expected a JSON object of booleans keyed by ${Object.keys(FILE_TYPES).join(', ')}` });
+  }
+  for (const [type, on] of changes) setTypeEnabled(type, on);
+  broadcastStack();
+  sendStack(res);
+});
+
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -257,7 +326,7 @@ app.get('/', (req, res) => {
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; display: flex; height: 100vh; background: #0f1117; color: #e0e6ed; }
     #sidebar { width: 320px; border-right: 1px solid #262936; overflow-y: auto; background: #161822; flex-shrink: 0; }
-    .header { padding: 16px; border-bottom: 1px solid #262936; font-weight: bold; font-size: 14px; color: #8b949e; display: flex; justify-content: space-between; }
+    .header { height: 48px; box-sizing: border-box; padding: 0 16px; border-bottom: 1px solid #262936; font-weight: bold; font-size: 14px; color: #8b949e; display: flex; align-items: center; justify-content: space-between; }
     .card { padding: 14px 16px; border-bottom: 1px solid #262936; cursor: pointer; transition: background 0.15s ease; }
     .card:hover { background: #1f2230; }
     .card.active { background: #252a3a; border-left: 3px solid #58a6ff; }
@@ -268,7 +337,15 @@ app.get('/', (req, res) => {
     .card.deleted .card-title, .card.deleted .card-time { color: #f85149; }
     .dismiss { background: none; border: none; color: #f85149; font-size: 18px; line-height: 1; padding: 0 2px; cursor: pointer; }
     .dismiss:hover { color: #ffffff; }
-    #preview { flex: 1; padding: 32px 48px; overflow-y: auto; background: #0f1117; line-height: 1.6; }
+    #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    /* Same height as the sidebar header so their bottom borders line up */
+    #controls { height: 48px; box-sizing: border-box; flex-shrink: 0; display: flex; align-items: center; gap: 18px; padding: 0 16px; border-bottom: 1px solid #262936; background: #161822; font-size: 12px; color: #8b949e; }
+    #controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    #controls input { margin: 0; accent-color: #58a6ff; color-scheme: dark; cursor: pointer; }
+    #clear { background: #252a3a; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+    #clear:hover { background: #2d3344; border-color: #484f58; color: #ffffff; }
+    body.disconnected #controls { opacity: 0.5; pointer-events: none; }
+    #preview { flex: 1; min-height: 0; padding: 32px 48px; overflow-y: auto; background: #0f1117; line-height: 1.6; }
     #preview img { max-width: 100%; border-radius: 6px; }
     code { background: #161822; padding: 3px 6px; border-radius: 4px; font-size: 85%; color: #e6edf3; }
     pre { background: #161822; padding: 16px; border-radius: 8px; overflow-x: auto; border: 1px solid #262936; }
@@ -294,14 +371,21 @@ app.get('/', (req, res) => {
 <body>
   <div id="sidebar">
     <div class="header">
-      <span>STACKED MD FILES</span>
+      <span>STACKED FILES</span>
       <span id="count">0</span>
     </div>
     <div id="status">Disconnected from md-stack, reconnecting...</div>
     <div id="warning"></div>
     <div id="card-list"></div>
   </div>
-  <div id="preview"><div class="empty">Select a file from the stack to preview...</div></div>
+  <div id="main">
+    <div id="controls">
+      <button id="clear" title="Remove every file from the stack">Clear</button>
+      <label title="Stack Markdown files"><input type="checkbox" data-type="md" checked>.md</label>
+      <label title="Stack Scala files"><input type="checkbox" data-type="scala">.scala</label>
+    </div>
+    <div id="preview"><div class="empty">Select a file from the stack to preview...</div></div>
+  </div>
   <div id="toast"></div>
 
   <script>
@@ -335,10 +419,14 @@ app.get('/', (req, res) => {
       }
     });
 
+    let enabledTypes = { md: true };
+
     function onStack(event) {
-      const { items, warning } = JSON.parse(event.data);
+      const { items, types, warning } = JSON.parse(event.data);
       stackData = items;
+      enabledTypes = types;
       document.getElementById('count').innerText = stackData.length;
+      document.querySelectorAll('#controls input[data-type]').forEach(box => { box.checked = types[box.dataset.type]; });
       renderWarning(warning);
 
       // Auto-select latest file if none selected or current was removed/deleted
@@ -393,6 +481,20 @@ app.get('/', (req, res) => {
       }
     });
 
+    // Clear and the checkboxes change state on the server, which pushes the new
+    // stack (and checkbox state) to every open dashboard
+    function post(url, body) {
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
+        .then(res => res.ok, () => false)
+        .then(ok => { if (!ok) showToast('Could not reach md-stack'); return ok; });
+    }
+
+    document.getElementById('clear').addEventListener('click', () => post('/api/clear'));
+
+    document.querySelectorAll('#controls input[data-type]').forEach(box => box.addEventListener('change', () => {
+      post('/api/types', { [box.dataset.type]: box.checked }).then(ok => { if (!ok) box.checked = !box.checked; });
+    }));
+
     function selectFile(path) {
       selectedPath = path;
       renderSidebar();
@@ -446,7 +548,8 @@ app.get('/', (req, res) => {
     function renderPreview() {
       const container = document.getElementById('preview');
       if (!selectedPath) {
-        container.innerHTML = '<div class="empty">No Markdown files modified yet...</div>';
+        const message = Object.values(enabledTypes).some(Boolean) ? 'No files modified yet...' : 'Tick a file type to stack its files...';
+        container.innerHTML = '<div class="empty">' + message + '</div>';
         return;
       }
       const item = stackData.find(i => i.path === selectedPath);

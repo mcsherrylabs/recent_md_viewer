@@ -1,7 +1,7 @@
 {
   "name": "recent_md_viewer",
-  "version": "1.1.0",
-  "description": "Watch a folder and live-stack recently changed Markdown files in a browser dashboard",
+  "version": "1.2.0",
+  "description": "Watch a folder and live-stack recently changed Markdown (and Scala) files in a browser dashboard",
   "bin": {
     "md-stack": "./index.js"
   },
@@ -10,7 +10,8 @@
     "md-stack.service"
   ],
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "keywords": [
     "markdown",

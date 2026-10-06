@@ -3,13 +3,15 @@
 `md-stack` watches a folder tree and puts every Markdown file that gets created or
 changed onto a live stack in your browser, newest first. It was built to review the
 plans, specs and notes that coding agents like Claude Code write, without having to
-go looking for which file just changed.
+go looking for which file just changed. It can stack Scala source files too.
 
 - Changed `.md` files show up instantly, rendered, with the most recent at the top
+- Tick `.scala` in the control panel to stack Scala files as well, shown as source
 - Click a card to preview it and copy its absolute path to the clipboard (handy for
   pasting into your editor)
 - Deleted files stay on the stack as red markers until you dismiss them
-- Files drop off the stack after a period of inactivity (30 minutes by default)
+- Files drop off the stack after a period of inactivity (30 minutes by default), or
+  all at once with **Clear**
 - Relative image links in the Markdown are resolved and displayed
 
 Only changes made **after** `md-stack` starts are shown. It doesn't list the
@@ -35,6 +37,25 @@ md-stack --dir ~/projects
 ```
 
 Then open the dashboard URL it prints (<http://127.0.0.1:26622> by default).
+
+The control panel above the preview has:
+
+- **Clear**, which empties the stack. Files that change after that are stacked as usual.
+- **`.md` and `.scala` checkboxes**, which pick the file types that are stacked (only
+  `.md` to start with). Unticking a type hides its files, and ticking it again brings
+  back the ones that haven't expired. Files that change while their type is unticked
+  aren't stacked.
+
+The stack and the checkboxes are kept by `md-stack`, so they're the same in every open
+dashboard and survive a reload, but a restart resets them. The controls are plain
+HTTP, so you can script them too:
+
+```bash
+curl http://127.0.0.1:26622/api/stack                  # the stack, as JSON
+curl -X POST http://127.0.0.1:26622/api/clear
+curl -X POST -H 'Content-Type: application/json' -d '{"scala": true}' \
+  http://127.0.0.1:26622/api/types                     # any of "md", "scala"
+```
 
 | Option | Default | Description |
 | --- | --- | --- |
@@ -74,6 +95,8 @@ Markdown (and images) under the watched folder.
   matter. Linux has no native equivalent, so there it uses
   [chokidar](https://github.com/paulmillr/chokidar). chokidar needs one inotify
   watch per directory (skipping the folders listed above) and per `.md` file.
+  `.scala` files are only watched once that box has been ticked, and then only
+  from when something in their folder changes.
   If a limit is hit, `md-stack` prints the error once, with a suggested fix,
   and then only counts the repeats. The dashboard also shows a warning, because
   anything in folders it couldn't watch won't appear. The usual fixes are:
@@ -122,6 +145,7 @@ git clone git@github.com:mcsherrylabs/recent_md_viewer.git
 cd recent_md_viewer
 npm install
 node index.js --dir .   # or `npm link` to use the md-stack command from your checkout
+npm test                # runs md-stack against a scratch folder with each watcher
 ```
 
 ## License
