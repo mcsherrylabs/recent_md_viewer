@@ -362,7 +362,7 @@ app.get('/', (req, res) => {
     #clear { background: #252a3a; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
     #clear:hover { background: #2d3344; border-color: #484f58; color: #ffffff; }
     body.disconnected #controls { opacity: 0.5; pointer-events: none; }
-    #preview { flex: 1; min-height: 0; padding: 32px 48px; overflow-y: auto; background: #0f1117; line-height: 1.6; }
+    #preview { flex: 1; min-height: 0; padding: 32px 48px; overflow-y: auto; overflow-anchor: none; background: #0f1117; line-height: 1.6; }
     #preview img { max-width: 100%; border-radius: 6px; }
     code { background: #161822; padding: 3px 6px; border-radius: 4px; font-size: 85%; color: #e6edf3; }
     pre { background: #161822; padding: 16px; border-radius: 8px; overflow-x: auto; border: 1px solid #262936; }
@@ -566,7 +566,7 @@ app.get('/', (req, res) => {
     let mermaidReady;
     function renderMermaid(container) {
       const blocks = container.querySelectorAll('pre > code.language-mermaid');
-      if (!blocks.length) return;
+      if (!blocks.length) return Promise.resolve();
       blocks.forEach(code => {
         const diagram = document.createElement('div');
         diagram.className = 'mermaid';
@@ -579,22 +579,34 @@ app.get('/', (req, res) => {
           return mod.default;
         })
         .catch(err => { mermaidReady = null; throw err; });
-      mermaidReady
+      return mermaidReady
         .then(mermaid => mermaid.run({ nodes: container.querySelectorAll('.mermaid') }))
         .catch(() => showToast('Could not render Mermaid diagrams'));
     }
 
+    // Every stack update re-sends all files, so re-rendering an unchanged preview
+    // would throw away the reader's scroll position
+    let rendered = null;
     function renderPreview() {
       const container = document.getElementById('preview');
       if (!selectedPath) {
+        rendered = null;
         const message = Object.values(enabledTypes).some(Boolean) ? 'No files modified yet...' : 'Tick a file type to stack its files...';
         container.innerHTML = '<div class="empty">' + message + '</div>';
         return;
       }
       const item = stackData.find(i => i.path === selectedPath);
       if (item) {
+        if (rendered && rendered.path === item.path && rendered.html === item.html) return;
+        const scrollTop = rendered && rendered.path === item.path ? container.scrollTop : 0;
+        const current = rendered = { path: item.path, html: item.html };
         container.innerHTML = \`<div style="font-size: 12px; color: #58a6ff; margin-bottom: 8px;">\${escapeHtml(item.path)}</div>\` + resolveImages(item.html, item.path);
-        renderMermaid(container);
+        container.scrollTop = scrollTop;
+        // Until the diagrams land the page is shorter, which clamps the scroll position;
+        // put it back without overriding wherever the reader has scrolled since
+        renderMermaid(container).then(() => {
+          if (rendered === current && container.scrollTop < scrollTop) container.scrollTop = scrollTop;
+        });
       }
     }
 
