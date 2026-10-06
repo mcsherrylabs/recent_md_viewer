@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const WebSocket = require('ws');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -153,6 +154,22 @@ for (const watcher of ['chokidar', 'native']) {
         assert.equal((await post('/api/types', body)).status, 400, JSON.stringify(body));
       }
       assert.deepEqual((await stack()).types, { md: true, scala: true });
+    });
+
+    it('sends a burst of changes in a few messages, not one per file', async () => {
+      await post('/api/clear');
+      const ws = new WebSocket(base.replace('http', 'ws'));
+      const messages = [];
+      ws.on('message', data => messages.push(JSON.parse(data)));
+      await new Promise(resolve => ws.on('open', resolve));
+      fs.mkdirSync(path.join(dir, 'burst'));
+      const files = Array.from({ length: 200 }, (_, i) => path.join('burst', `f${i}.md`));
+      for (const file of files) write(file);
+      await waitForListed(files);
+      await sleep(300); // the trailing send
+      ws.close();
+      assert.ok(messages.length < 30, `${messages.length} messages`);
+      assert.equal(messages.at(-1).items.length, files.length);
     });
   });
 }

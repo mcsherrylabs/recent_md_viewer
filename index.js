@@ -271,7 +271,24 @@ function serializeStack() {
   return JSON.stringify({ items, types, warning: watchWarning() });
 }
 
+// Every change sends the whole stack, so a burst (a git checkout, an unzip) sent
+// it once per file: quadratic, and enough to run md-stack out of memory. Changes
+// within BROADCAST_MS of the last send now go out together in one trailing send
+const BROADCAST_MS = 200;
+let lastBroadcast = 0;
+let broadcastTimer = null;
+
 function broadcastStack() {
+  if (broadcastTimer) return;
+  const wait = lastBroadcast + BROADCAST_MS - Date.now();
+  if (wait > 0) {
+    broadcastTimer = setTimeout(() => {
+      broadcastTimer = null;
+      broadcastStack();
+    }, wait);
+    return;
+  }
+  lastBroadcast = Date.now();
   const data = serializeStack();
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) client.send(data);
