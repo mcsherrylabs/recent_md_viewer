@@ -21,7 +21,7 @@ function freePort() {
   });
 }
 
-for (const watcher of ['chokidar', 'native']) {
+for (const watcher of ['chokidar', 'native', 'hybrid']) {
   describe(`md-stack (${watcher} watcher)`, () => {
     let dir, proc, base;
 
@@ -65,7 +65,8 @@ for (const watcher of ['chokidar', 'native']) {
       const port = await freePort();
       base = `http://127.0.0.1:${port}`;
       proc = spawn(process.execPath, [path.join(__dirname, '..', 'index.js'),
-        '--dir', dir, '--port', String(port), '--watcher', watcher], { stdio: ['ignore', 'pipe', 'pipe'] });
+        '--dir', dir, '--port', String(port), '--watcher', watcher,
+        '--scan-interval', '0.1', '--watch-idle', '0.5', '--max-watches', '2'], { stdio: ['ignore', 'pipe', 'pipe'] });
       let output = '';
       await new Promise((resolve, reject) => {
         proc.stdout.on('data', chunk => { if ((output += chunk).includes('Ready:')) resolve(); });

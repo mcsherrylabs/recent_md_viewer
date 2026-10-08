@@ -6,7 +6,7 @@ Description=md-stack live markdown viewer
 # `which md-stack`; systemd doesn't see the PATH that nvm sets up, so both need
 # to be absolute. Change --dir to the folder you want to watch.
 [Service]
-ExecStart=NODE_BIN MD_STACK_BIN --dir %h/develop --port 26622
+ExecStart=NODE_BIN MD_STACK_BIN --dir %h/develop --port 26622 --ignore-dir "container-home-*" --watcher hybrid --scan-interval 5 --watch-idle 60 --max-watches 128
 Restart=on-failure
 RestartSec=5
 

@@ -16,8 +16,14 @@ program
   .option('-H, --host <address>', 'address to listen on (0.0.0.0 exposes it to your network)', '127.0.0.1')
   .option('-e, --expiry <minutes>', 'expiry time in minutes for inactive files', '30')
   .option('-d, --dir <path>', 'directory to watch', process.cwd())
+  .option('--ignore-dir <pattern>', 'exclude directory names (supports * and ?); repeat to add patterns',
+    (value, patterns) => [...patterns, value], [])
+  .option('--include-hidden', 'watch hidden directories (standard exclusions still apply)', false)
   .addOption(new Option('-w, --watcher <type>', 'file watcher to use (auto: native on macOS/Windows, chokidar elsewhere)')
-    .choices(['auto', 'native', 'chokidar']).default('auto'))
+    .choices(['auto', 'native', 'chokidar', 'hybrid']).default('auto'))
+  .option('--scan-interval <seconds>', 'hybrid: seconds between scans of unwatched files', '5')
+  .option('--watch-idle <seconds>', 'hybrid: release directory watches after inactivity', '60')
+  .option('--max-watches <number>', 'hybrid: maximum active directory watches', '128')
   .parse(process.argv);
 
 const options = program.opts();
@@ -25,6 +31,15 @@ const PORT = parseInt(options.port, 10);
 const HOST = options.host;
 const EXPIRY_MS = parseFloat(options.expiry) * 60 * 1000;
 const WATCH_DIR = path.resolve(options.dir);
+const SCAN_INTERVAL_MS = Number(options.scanInterval) * 1000;
+const WATCH_IDLE_MS = Number(options.watchIdle) * 1000;
+const MAX_WATCHES = Number(options.maxWatches);
+if (!Number.isFinite(SCAN_INTERVAL_MS) || SCAN_INTERVAL_MS < 50 ||
+    !Number.isFinite(WATCH_IDLE_MS) || WATCH_IDLE_MS < 50 ||
+    !Number.isSafeInteger(MAX_WATCHES) || MAX_WATCHES < 1) {
+  program.error('scan interval and watch idle must be at least 0.05 seconds; max watches must be a positive integer');
+}
+let hybridWatcher;
 
 // macOS (FSEvents) and Windows watch a whole tree natively with one handle, so
 // size doesn't matter. Linux has no native recursive watch: Node emulates it by
@@ -85,9 +100,27 @@ setInterval(() => {
 const IGNORED_DIRS = new Set([
   'node_modules', '.git', 'target', 'venv', '.venv', '__pycache__', 'dist', 'build',
   '.next', '.cache', '.cargo', '.gradle', '.pytest_cache', '.mypy_cache', '.turbo',
-  'coverage', 'vendor'
+  'coverage', 'vendor', 'tmp', 'temp'
 ]);
-const isIgnored = relPath => relPath.split(path.sep).some(seg => IGNORED_DIRS.has(seg));
+// Match directory basenames at any depth. Compile once; no filesystem glob
+// expansion or additional tree scan is needed.
+const ignoredDirPatterns = options.ignoreDir.map(pattern => {
+  if (!pattern || /[/\\]/.test(pattern)) {
+    program.error('--ignore-dir expects a directory name pattern without path separators');
+  }
+  const expression = [...pattern].map(char => char === '*' ? '.*' : char === '?' ? '.' :
+    char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('');
+  return new RegExp(`^${expression}$`);
+});
+const isIgnored = (relPath, stats) => {
+  if (!relPath) return false; // Always keep the explicitly selected watch root.
+  const segments = relPath.split(path.sep);
+  // A hidden Markdown filename is allowed; only directory components count.
+  if (!stats?.isDirectory()) segments.pop();
+  return segments.some(segment => IGNORED_DIRS.has(segment) ||
+    (!options.includeHidden && segment.startsWith('.')) ||
+    ignoredDirPatterns.some(pattern => pattern.test(segment)));
+};
 
 const escapeHtml = str => str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
@@ -148,7 +181,9 @@ function watchErrorSummary() {
 function watchWarning() {
   if (!watchErrors.size) return null;
   const hints = new Set([...watchErrors.keys()].map(code => WATCH_ERROR_HINTS[code]).filter(Boolean));
-  return { summary: `${watchErrorSummary()}, so changes in them won't show up.`, hints: [...hints] };
+  return { summary: hybridWatcher
+    ? `${watchErrorSummary()}; periodic scans still detect changes.`
+    : `${watchErrorSummary()}, so changes in them won't show up.`, hints: [...hints] };
 }
 
 function reportWatchErrors() {
@@ -194,12 +229,14 @@ function schedulePath(relPath) {
 
 function settlePath(relPath) {
   const absPath = path.join(WATCH_DIR, relPath);
-  fs.stat(absPath, (err, stats) => {
+  const statFile = hybridWatcher ? fs.lstat : fs.stat;
+  statFile(absPath, (err, stats) => {
     // Stacked files stay current while their type is unticked (and hidden), so
     // they're up to date if it's ticked again
     const stacked = activeStack.has(relPath);
     const type = fileType(relPath);
     if (!err) {
+      if (hybridWatcher && stats.isSymbolicLink() && stacked) { removeFile(absPath); return; }
       if (stats.isFile() && (stacked || (enabledTypes.has(type) && stats.mtimeMs >= tickedAt[type]))) updateFile(absPath);
     } else if (err.code === 'ENOENT') {
       if (stacked || enabledTypes.has(type)) removeFile(absPath);
@@ -215,7 +252,7 @@ function watchWithChokidar() {
   const watchStart = Date.now();
   const watcher = require('chokidar').watch(WATCH_DIR, {
     ignored: (filePath, stats) =>
-      isIgnored(path.relative(WATCH_DIR, filePath)) || (stats?.isFile() && !watchedTypes.has(fileType(filePath))),
+      isIgnored(path.relative(WATCH_DIR, filePath), stats) || (stats?.isFile() && !watchedTypes.has(fileType(filePath))),
     persistent: true,
     ignoreInitial: true,
     ignorePermissionErrors: true
@@ -262,13 +299,28 @@ function watchNatively() {
   console.log(' Ready: watching the whole tree with the native watcher, waiting for changes...');
 }
 
+async function watchWithHybrid() {
+  hybridWatcher = require('./hybrid-watcher').createHybridWatcher({
+    root: WATCH_DIR, scanIntervalMs: SCAN_INTERVAL_MS, idleMs: WATCH_IDLE_MS,
+    maxWatches: MAX_WATCHES, isIgnored,
+    isSupported: rel => Boolean(fileType(rel)),
+    shouldNotify: rel => activeStack.has(rel) || enabledTypes.has(fileType(rel)),
+    onPath: schedulePath, onError: onWatchError
+  });
+  await hybridWatcher.start();
+  scanDone = true;
+  const status = hybridWatcher.status();
+  console.log(` Ready: hybrid scanned ${status.trackedFiles} files; ${status.activeDirectories} active directory watches (limit ${MAX_WATCHES}).`);
+}
+
 // Files of unticked types stay on the stack, hidden, until they expire
 function serializeStack() {
   const items = Array.from(activeStack.values())
     .filter(item => enabledTypes.has(fileType(item.path)))
     .sort((a, b) => b.timestamp - a.timestamp);
   const types = Object.fromEntries(Object.keys(FILE_TYPES).map(type => [type, enabledTypes.has(type)]));
-  return JSON.stringify({ items, types, warning: watchWarning() });
+  return JSON.stringify({ items, types, warning: watchWarning(),
+    ...(hybridWatcher ? { watcher: hybridWatcher.status() } : {}) });
 }
 
 // Every change sends the whole stack, so a burst (a git checkout, an unzip) sent
@@ -646,10 +698,17 @@ const urlHost = ['0.0.0.0', '::'].includes(HOST) ? 'localhost' : HOST.includes('
 server.listen(PORT, HOST, () => {
   console.log(`\n md-stack active!`);
   console.log(` Watching: ${WATCH_DIR}`);
-  console.log(` Watcher : ${USE_NATIVE ? 'native' : 'chokidar'}`);
+  console.log(` Watcher : ${options.watcher === 'hybrid' ? 'hybrid' : USE_NATIVE ? 'native' : 'chokidar'}`);
+  if (options.watcher === 'hybrid') console.log(` Hybrid: scan every ${options.scanInterval}s; release idle watches after ${options.watchIdle}s; limit ${MAX_WATCHES}`);
+  console.log(` Ignored directories: ${[...IGNORED_DIRS, ...options.ignoreDir].join(', ')}`);
+  console.log(` Hidden directories: ${options.includeHidden ? 'included (standard exclusions still apply)' : 'ignored'}`);
+  if (USE_NATIVE && process.platform === 'linux') {
+    console.warn(' Native recursive watching on Linux allocates watches before exclusions; use --watcher chokidar to reduce inotify usage.');
+  }
   console.log(` Expiry  : ${options.expiry} minutes`);
   console.log(` Listening: ${HOST}`);
   console.log(` Dashboard: http://${urlHost}:${PORT}\n`);
-  if (USE_NATIVE) watchNatively();
+  if (options.watcher === 'hybrid') watchWithHybrid().catch(onWatchError);
+  else if (USE_NATIVE) watchNatively();
   else watchWithChokidar();
 });

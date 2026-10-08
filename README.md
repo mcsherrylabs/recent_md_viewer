@@ -61,10 +61,15 @@ curl -X POST -H 'Content-Type: application/json' -d '{"scala": true}' \
 | Option | Default | Description |
 | --- | --- | --- |
 | `-d, --dir <path>` | current directory | Folder to watch (recursively) |
+| `--ignore-dir <pattern>` | none | Additional directory names to exclude at any depth; supports `*` and `?`, and can be repeated. Quote patterns to prevent shell expansion |
+| `--include-hidden` | off | Include dot-directories; standard and custom exclusions still apply |
 | `-p, --port <number>` | `26622` | Port for the web dashboard |
 | `-H, --host <address>` | `127.0.0.1` | Address to listen on |
 | `-e, --expiry <minutes>` | `30` | Remove files from the stack after this long without changes |
-| `-w, --watcher <type>` | `auto` | `native`, `chokidar`, or `auto` (native on macOS and Windows, chokidar elsewhere). See "Large trees" |
+| `-w, --watcher <type>` | `auto` | `native`, `chokidar`, `hybrid`, or `auto` (native on macOS and Windows, chokidar elsewhere). See "Large trees" |
+| `--scan-interval <seconds>` | `5` | Hybrid: delay between completed scans |
+| `--watch-idle <seconds>` | `60` | Hybrid: release directory watches after this much inactivity |
+| `--max-watches <number>` | `128` | Hybrid: maximum simultaneously watched directories |
 | `-V, --version` | | Print the version |
 | `-h, --help` | | Show help |
 
@@ -93,7 +98,15 @@ Markdown (and images) under the watched folder.
 - **Skipped folders.** Dependency, build and cache folders are never watched:
   `node_modules`, `.git`, `target`, `venv`, `.venv`, `__pycache__`, `dist`,
   `build`, `.next`, `.cache`, `.cargo`, `.gradle`, `.pytest_cache`,
-  `.mypy_cache`, `.turbo`, `coverage`, `vendor`.
+  `.mypy_cache`, `.turbo`, `coverage`, `vendor`, `tmp`, `temp`.
+  All directories beginning with `.` are also skipped unless `--include-hidden`
+  is set. Hidden Markdown filenames are still watched. The explicitly selected
+  `--dir` root is always watched, even if its own name matches an exclusion.
+  Add exclusions with repeatable directory basename patterns, for example:
+  `md-stack --dir ~/develop --ignore-dir 'container-home-*' --ignore-dir scratch`.
+  Patterns match whole directory names at every depth, not relative paths.
+  With Chokidar these exclusions prune traversal before watches are allocated;
+  with the native watcher they only filter events.
 - **Large trees.** On macOS and Windows, `md-stack` uses the operating system's
   native recursive watcher. That's one handle for the whole tree, so size doesn't
   matter. Linux has no native equivalent, so there it uses
@@ -114,6 +127,28 @@ Markdown (and images) under the watched folder.
   `--watcher chokidar` switches macOS and Windows back to chokidar if the native
   watcher misbehaves. `--watcher native` on Linux isn't recommended: Node emulates
   it by watching every file in the tree, including `node_modules`.
+- **Hybrid watching.** `--watcher hybrid` scans the allowed tree periodically,
+  comparing supported files' timestamps, sizes and inode numbers. Existing files
+  form an initial baseline and are not stacked until they change. Quiet folders
+  use no OS watches. A relevant change activates a nonrecursive watch on that
+  file's immediate parent, so subsequent edits arrive promptly. Watches expire
+  after inactivity; at the limit, the least recently active directory is evicted.
+  Scans continue to detect edits, creations and deletions in unwatched folders.
+  This also works for enabled Scala files, and keeps previously stacked files
+  current while their type is hidden.
+
+  ```bash
+  md-stack --dir ~/develop --watcher hybrid --scan-interval 5 \
+    --watch-idle 60 --max-watches 128 --ignore-dir 'container-home-*'
+  ```
+
+  Scans do not overlap; the interval starts after each scan finishes. A first edit
+  in a quiet folder is delayed until its next scan, which may take longer on large
+  trees. Short-lived files created and removed between scans can be missed.
+  Scanning trades some CPU/disk activity for fewer inotify watches. Symlinks are
+  not followed. Failed subtree reads preserve the previous baseline rather than
+  falsely reporting deletion; `watcher` in `/api/stack` reports active watches,
+  tracked files, last completed scan and scan errors.
 - **Reconnects automatically.** If `md-stack` restarts or the connection drops
   (sleep, SSH tunnel), the open dashboard reconnects without a reload. Until it
   does, it shows a "Disconnected" banner. The stack lives in memory, so a
@@ -130,8 +165,11 @@ sed -e "s|NODE_BIN|$(which node)|" -e "s|MD_STACK_BIN|$(which md-stack)|" \
   > ~/.config/systemd/user/md-stack.service
 ```
 
-Edit `--dir` (and any other options) in `~/.config/systemd/user/md-stack.service`,
-then:
+Edit `--dir` (and any other options) in `~/.config/systemd/user/md-stack.service`.
+The template uses hybrid watching and excludes `container-home-*` directories;
+adjust scan/idle intervals, the watch cap, and `--ignore-dir` options in its
+`ExecStart` command as needed.
+Then:
 
 ```bash
 systemctl --user daemon-reload
